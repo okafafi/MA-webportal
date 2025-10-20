@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="100" viewBox="0 0 300 100">
+  <style>
+    .blue { fill: #14213D; }
+    .gold { fill: #FDC449; }
+    text { font-family: Gotham, Arial, sans-serif; font-weight: bold; }
+  </style>
+  <path class="blue" d="M50 15 L80 85 L20 85 Z M50 35 L35 75 H65 Z"/>
+  <text x="110" y="45" font-size="28" class="gold">MYSTERY</text>
+  <text x="110" y="80" font-size="28" class="blue">AGENT</text>
+</svg>

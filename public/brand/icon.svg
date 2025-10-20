@@ -1,0 +1,16 @@
+<!-- public/brand/icon.svg -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <style>
+      .blue { fill: #14213D; }
+      .gold { fill: #FDC449; }
+    </style>
+  </defs>
+  <!-- Navy tile (lets the icon pop on any bg) -->
+  <rect class="blue" x="0" y="0" width="64" height="64" rx="12" />
+  <!-- MA monogram -->
+  <!-- M -->
+  <path class="gold" d="M12 48V16h6l6 9 6-9h6v32h-6V31l-6 9-6-9v17z"/>
+  <!-- A -->
+  <path class="gold" d="M46 48l-10-32h6l10 32h-6zm-1-10h-6l2-6h2l2 6z"/>
+</svg>
