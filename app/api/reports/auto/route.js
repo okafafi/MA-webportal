@@ -1,810 +1,324 @@
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-export const maxDuration = 60;
-export const preferredRegion = ["sfo1","pdx1","cle1","cdg1","fra1"];
+export const runtime = 'nodejs';
 
-import { createRequire } from "node:module";
-const require = createRequire(import.meta.url);
+import { NextResponse } from 'next/server';
+import { getServiceClient, toPublicUrl } from '../../../../lib/supa';
+import { buildMinimalPdf, __fontDiag } from '../../../../lib/report_pdf';
 
-import { supabaseAdmin } from '../../../../lib/supabaseAdmin';
-import { createPdfDoc, __pdfPatchInfo } from "../../../../lib/report_pdf.js";
+// --- helpers: safe accessors ---
+const val = (x, d = null) => (x === undefined || x === null ? d : x);
+// Fetch all data we need from *your actual tables* without guessing names
+async function fetchSubmissionBundle({ submissionId, missionId }) {
+  const supa = getServiceClient();
 
-const json=(s,o)=>new Response(JSON.stringify(o,null,2),{
-  status:s,
-  headers:{'Content-Type':'application/json','Cache-Control':'no-store'}
-});
-const fmt = (dt)=> { try{ return new Date(dt).toLocaleString(); } catch { return String(dt); } };
+  if (!submissionId) {
+    throw new Error('submissionId is required.');
+  }
 
-const safeNum = (value, fallback = 0) => {
-  const num = Number(value);
-  return Number.isFinite(num) ? num : fallback;
-};
-
-async function fetchImageBuffer(url) {
+  let submission = null;
   try {
-    const clean = typeof url === "string" ? url.trim() : "";
-    if (!clean) return null;
-    const res = await fetch(encodeURI(clean), { redirect: "follow" });
-    if (!res.ok) return null;
-    const ab = await res.arrayBuffer();
-    return Buffer.from(ab);
+    const { data, error } = await supa
+      .from('mission_submissions')
+      .select('*')
+      .eq('id', submissionId)
+      .maybeSingle();
+    submission = error ? null : data;
   } catch {
-    return null;
+    submission = null;
   }
-}
 
-async function drawPhotosRow(doc, urls, { width = 120, gap = 10 } = {}) {
-  if (!Array.isArray(urls) || urls.length === 0) return 0;
-  let x = doc.page.margins.left;
-  const y = doc.y;
-  let drawn = 0;
-  for (const u of urls) {
-    const buf = await fetchImageBuffer(u);
-    if (buf) {
-      doc.image(buf, x, y, { fit: [width, width * 0.75] });
-      drawn++;
-    } else {
-      doc.rect(x, y, width, width * 0.75).stroke();
-    }
-    x += width + gap;
+  const { data: itemsRaw, error: itemsErr } = await supa
+    .from('mission_submission_items')
+    .select(
+      'id, submission_id, checklist_item_id, yes_no, comment, timer_seconds, rating, rating_score, photo_attachment_id, order_photo_attachment_id, video_attachment_id'
+    )
+    .eq('submission_id', submissionId);
+  if (itemsErr) throw new Error(`items: ${itemsErr.message}`);
+  const items = itemsRaw || [];
+
+  const checklistIds = [...new Set(items.map((i) => i.checklist_item_id).filter(Boolean))];
+  let checklistMap = {};
+  if (checklistIds.length) {
+    const { data: checklistRows, error: chkErr } = await supa
+      .from('mission_checklist_items')
+      .select('id, title, answer_type')
+      .in('id', checklistIds);
+    if (chkErr) throw new Error(`checklist: ${chkErr.message}`);
+    checklistMap = (checklistRows || []).reduce((m, r) => {
+      m[r.id] = r;
+      return m;
+    }, {});
   }
-  doc.x = doc.page.margins.left;
-  doc.moveDown(0.8);
-  return drawn;
-}
 
-async function renderReportDocument(doc, payload) {
-  const {
-    title = "Mission Report",
-    mission = {},
-    submission = {},
-    photoUrls = [],
-    checklist = [],
-  } = payload || {};
-
-  return await new Promise((resolve, reject) => {
-    const chunks = [];
-    doc.on("data", (c) => chunks.push(c));
-    doc.on("end", () => resolve(Buffer.concat(chunks)));
-    doc.on("error", reject);
-
-    (async () => {
-      const ratings = (checklist || [])
-        .map((item) => safeNum(item.rating ?? item.rating_score ?? item.rating_value, NaN))
-        .filter(Number.isFinite);
-      const overall = ratings.length
-        ? (ratings.reduce((a, b) => a + b, 0) / ratings.length).toFixed(1)
-        : null;
-
-      doc.font("Inter-Bold").fontSize(18).fillColor("black").text(title);
-      doc.font("Inter-Regular").fontSize(10).fillColor("#555");
-      doc.text(`Mission: ${mission.title || mission.id || "—"}`);
-      if (mission.store) doc.text(`Store: ${mission.store}`);
-      if (mission.location?.address) doc.text(`Address: ${mission.location.address}`);
-      doc.text(`Submitted: ${submission.submitted_at ? fmt(submission.submitted_at) : "—"}`);
-      if (overall) {
-        doc.moveDown(0.3);
-        doc.font("Inter-Bold").fontSize(12).fillColor("#111").text(`Overall Rating: ${overall}/5`);
-      }
-      doc.font("Inter-Regular").fillColor("black").moveDown(0.8);
-
-      if (Array.isArray(photoUrls) && photoUrls.length) {
-        doc.font("Inter-Bold").fontSize(12).text("Photos", { underline: true });
-        doc.moveDown(0.4);
-        await drawPhotosRow(doc, photoUrls.slice(0, 3));
-        if (photoUrls.length > 3) {
-          await drawPhotosRow(doc, photoUrls.slice(3, 6));
-        }
-      }
-
-      doc.moveDown(0.4);
-      doc.font("Inter-Bold").fontSize(14).text("Checklist", { underline: true });
-      doc.moveDown(0.4);
-
-      if (!Array.isArray(checklist) || checklist.length === 0) {
-        doc.font("Inter-Regular").fontSize(11).fillColor("#555").text("No checklist items.");
-        doc.fillColor("black");
-      } else {
-        for (const item of checklist) {
-          const itemTitle = item.title || item.displayTitle || item.text || "Checklist item";
-          doc.font("Inter-Bold").fontSize(12).fillColor("black").text(itemTitle);
-          doc.font("Inter-Regular").fontSize(10).fillColor("#444");
-
-          const yn = item.yes_no ?? item.value_yn;
-          if (yn != null) doc.text(`Yes/No: ${yn ? "Yes" : "No"}`);
-
-          const rating = item.rating ?? item.rating_score ?? item.rating_value;
-          if (rating != null) doc.text(`Rating: ${rating}/5`);
-
-          const timer = item.timer_seconds ?? item.timerSeconds;
-          if (timer != null) doc.text(`Timer: ${timer}s`);
-
-          if (item.comment) {
-            doc.text(`Comment: ${String(item.comment)}`);
-          }
-          doc.fillColor("black");
-
-          if (Array.isArray(item.photoUrls) && item.photoUrls.length) {
-            await drawPhotosRow(doc, item.photoUrls.slice(0, 3));
-          }
-
-          doc.moveDown(0.5);
-        }
-      }
-
-      doc.end();
-    })().catch(reject);
-  });
-}
-
-async function collectSubmissionPhotos({ supabaseAdmin, submissionId }) {
-  const { data, error } = await supabaseAdmin
-    .from('mission_answers')
-    .select('item_id, media_type, media_path')
+  const { data: assetsRaw, error: assetsErr } = await supa
+    .from('mission_submission_assets')
+    .select('id, submission_id, kind, bucket, path, bytes, mime, created_at')
     .eq('submission_id', submissionId)
-    .not('media_path', 'is', null);
+    .order('created_at', { ascending: true });
+  if (assetsErr) throw new Error(`assets: ${assetsErr.message}`);
+  const assets = assetsRaw || [];
+  const assetById = new Map(assets.map((a) => [a.id, a]));
 
-  if (error) throw error;
+  const { data: answersRaw, error: ansErr } = await supa
+    .from('mission_answers')
+    .select(
+      'id, submission_id, item_id, value_yn, value_text, value_number, value_duration_ms, media_path, media_type, created_at'
+    )
+    .eq('submission_id', submissionId)
+    .order('created_at', { ascending: true });
+  if (ansErr) throw new Error(`answers: ${ansErr.message}`);
+  const answers = answersRaw || [];
 
-  const photosByItem = new Map();
-  const gallery = [];
-
-  for (const row of data || []) {
-    const type = String(row.media_type || '').toLowerCase();
-    if (!(type === 'photo' || type.startsWith('image'))) continue;
-
-    const mediaPath = (row.media_path || '').trim();
-    if (!mediaPath) continue;
-
-    const { data: pub } = supabaseAdmin
-      .storage.from('mission-uploads')
-      .getPublicUrl(mediaPath);
-    const url = pub?.publicUrl;
-    if (!url || !url.startsWith('https://')) continue;
-
-    const arr = photosByItem.get(row.item_id) || [];
-    arr.push(url);
-    photosByItem.set(row.item_id, arr);
-    gallery.push(url);
+  let mission = null;
+  if (missionId) {
+    try {
+      const { data, error } = await supa
+        .from('missions')
+        .select('id, title, status, store, location')
+        .eq('id', missionId)
+        .maybeSingle();
+      mission = error ? null : data;
+    } catch {
+      mission = null;
+    }
   }
 
-  const galleryUrls = Array.from(new Set(gallery)).slice(0, 6);
-  return { photosByItem, galleryUrls };
-}
+    // Build checklist from items (primary source)
+    const checklistFromItems = items.map((i) => {
+      const meta = checklistMap[i.checklist_item_id] || {};
+      const media = [];
 
-// Simple KPIs from yes/no items
-function kpisFromChecklist(ans=[]) {
-  const yesNo = ans.filter(a=>a.yesNo);
-  const total = yesNo.length || 1;
-  const yesCount = yesNo.filter(a=>!!a.yesNoValue).length;
-  const overall = Math.round((yesCount/total)*100);
-  const service = Math.max(70, Math.min(98, overall - 2));
-  const compliance = Math.max(75, Math.min(99, overall + 3));
-  const speed = Math.max(70, Math.min(97, overall - 6));
-  return { overall, service, compliance, speed };
-}
+      const pushAsset = (assetId) => {
+        if (!assetId) return;
+        const a = assetById.get(assetId);
+        if (a) {
+          media.push({
+            kind: a.kind,
+            mime: a.mime,
+            path: a.path,
+            url: toPublicUrl(a.path),
+          });
+        }
+      };
+      pushAsset(i.photo_attachment_id);
+      pushAsset(i.order_photo_attachment_id);
+      pushAsset(i.video_attachment_id);
 
-function normalizeAnswersForPdf(answers = []) {
-  const rows = [];
-  const attachments = [];
+      // Fallback media from answers if no asset rows exist
+      if (!media.length) {
+        const ans = answers.find((a) => a.item_id === i.checklist_item_id && a.media_path);
+        if (ans && ans.media_path) {
+          media.push({
+            kind: ans.media_type || 'unknown',
+            mime: null,
+            path: ans.media_path,
+            url: toPublicUrl(ans.media_path),
+          });
+        }
+      }
 
-  (answers || []).forEach((a, idx) => {
-    if (!a) return;
-    const id =
-      a.checklist_item_id ||
-      a.id ||
-      a.itemId ||
-      (typeof a.itemIndex !== "undefined" ? `auto-${a.itemIndex}` : `auto-${idx}`);
-    const title = a.text || a.title || `Item ${idx + 1}`;
-    const yesNo =
-      typeof a.yesNoValue === "boolean"
-        ? a.yesNoValue
-        : typeof a.yesNo === "boolean"
-          ? a.yesNo
-          : null;
-    const comment =
-      typeof a.comment === "string" && a.comment.trim().length
-        ? a.comment.trim()
-        : null;
-    const timer =
-      Number.isFinite(a.timerSec)
-        ? Number(a.timerSec)
-        : Number.isFinite(a.timer_seconds)
-          ? Number(a.timer_seconds)
-          : null;
-    const ratingRaw = Number.isFinite(a.rating)
-      ? Number(a.rating)
-      : Number.isFinite(a.rating_value)
-        ? Number(a.rating_value)
-        : null;
-    const rating =
-      ratingRaw != null ? Math.min(5, Math.max(1, Math.round(ratingRaw))) : null;
-
-    const row = {
-      checklist_item_id: id,
-      title,
-      yes_no: typeof yesNo === "boolean" ? yesNo : null,
-      comment,
-      timer_seconds: timer,
-      rating,
-      rating_value: rating,
-    };
-
-    const photos = Array.isArray(a.photos)
-      ? a.photos
-      : Array.isArray(a.photoUrls)
-        ? a.photoUrls
-        : [];
-    if (photos.length) {
-      const attId = `auto-photo-${idx}-0`;
-      row.photo_attachment_id = attId;
-      attachments.push({
-        id: attId,
-        public_url: String(photos[0]),
-        content_type: "image/jpeg",
-        size: null,
-        path: null,
-      });
-    }
-
-    const videos = Array.isArray(a.videos)
-      ? a.videos
-      : Array.isArray(a.videoUrls)
-        ? a.videoUrls
-        : [];
-    if (videos.length) {
-      const attId = `auto-video-${idx}-0`;
-      row.video_attachment_id = attId;
-      attachments.push({
-        id: attId,
-        public_url: String(videos[0]),
-        content_type: "video/mp4",
-        size: null,
-        path: null,
-      });
-    }
-
-    rows.push(row);
-  });
-
-  return { rows, attachments };
-}
-
-export async function POST(req){
-  const stage = {
-    step: "start",
-    photoUrls: [],
-    photosRequested: 0,
-    itemPhotoCounts: {},
-    photosCount: 0,
-  };
-  let reportId = null;
-  let baseMeta = null;
-  let pdfUrl = null;
-  let answersCount = 0;
-  let itemsCount = 0;
-  let hasChecklist = false;
-  try{
-    const s = supabaseAdmin;
-    const url = new URL(req.url);
-    const diag = url.searchParams.get("diag") === "1";
-
-    if (diag) {
-      const pkg = require("pdfkit/package.json");
-      return new Response(JSON.stringify({
-        ok: true,
-        diag: true,
-        pdfkitVersion: pkg.version,
-        patchInfo: __pdfPatchInfo,
-        initDefaultFontPatched: true
-      }), {
-        status: 200,
-        headers: { "Content-Type": "application/json", "Cache-Control": "no-store" }
-      });
-    }
-
-    const body = await req.json().catch(()=>({}));
-    stage.step = "validate";
-    const orgId = body.orgId || body.org_id || null;
-    const missionId = body.missionId || body.mission_id || null;
-    const agentId = body.agentId || body.agent_id || null;
-    let submissionId = String(body.submissionId || body.submission_id || '').trim();
-    stage.submission_id = submissionId || null;
-    stage.resolveSource = "body";
-
-    const missing = [];
-    if (!orgId) missing.push("orgId");
-    if (!missionId) missing.push("missionId");
-    if (!agentId) missing.push("agentId");
-    if (missing.length) {
-      return new Response(
-        JSON.stringify({ ok: false, error: `Missing required fields: ${missing.join(", ")}`, stage }, null, 2),
-        { status: 400, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } }
-      );
-    }
-
-    if (!submissionId) {
-      return new Response(
-        JSON.stringify({ ok: false, error: "submissionId required", stage }, null, 2),
-        { status: 400, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } }
-      );
-    }
-
-    stage.step = "resolve-submission";
-    const resolveSource = "body";
-    stage.resolveSource = resolveSource;
-
-    const wantedCols = [
-      "id",
-      "org_id",
-      "mission_id",
-      "agent_id",
-      "status",
-      "started_at",
-      "submitted_at",
-      "meta_json",
-      "comment",
-      "timer_ms",
-    ].join(", ");
-
-    stage.step = "fetch-submission";
-
-    const { data: sub, error: subErr } = await s
-      .from("mission_submissions")
-      .select(wantedCols)
-      .eq("id", submissionId)
-      .single();
-    if (subErr || !sub) return json(404,{ ok: false, error:"submission not found", stage });
-
-    if (!sub?.submitted_at) {
-      stage.nullSubmittedAt = true;
-    }
-    stage.submission = sub;
-    submissionId = sub?.id ?? submissionId;
-    stage.submission_id = sub?.id ?? null;
-    stage.submitted_at = sub?.submitted_at ?? null;
-    stage.resolveSource = resolveSource;
-
-    const submissionPayload = sub?.meta_json ?? {};
-
-    // Mission
-    stage.step = "fetch-mission";
-    const { data: mission, error: eMiss } = await s.from("missions").select("*").eq("id", sub.mission_id).single();
-    if (eMiss || !mission) return json(404,{ ok: false, error:"mission not found", stage });
-
-    stage.step = "prepare-pdf";
-    const store = mission.store || "";
-    const reportTitle = `Mission Report — ${store || mission.title || mission.id}`;
-    const win = `${fmt(mission.starts_at)} -> ${fmt(mission.expires_at)}`;
-    const submittedAt = fmt(sub.submitted_at);
-    const address = mission.address || mission.location?.address || "";
-
-    // Answers + KPIs
-    const answers = submissionPayload?.checklist || [];
-    const kpis = kpisFromChecklist(answers);
-    stage.kpis = kpis;
-    const overall10 =
-      typeof sub?.meta_json?.overall_rating_10 === "number"
-        ? Number(sub.meta_json.overall_rating_10)
-        : null;
-    stage.overall10 = overall10;
-
-    stage.step = "fetch-checklist-answers";
-    const answersRes = await s
-      .from("mission_answers")
-      .select(
-        `
-        id,
-        submission_id,
-        item_id,
-        value_yn,
-        value_text,
-        value_number,
-        value_duration_ms,
-        media_path,
-        media_type,
-        created_at
-      `
-      )
-      .eq("submission_id", sub.id)
-      .order("created_at", { ascending: true });
-    if (answersRes.error) {
-      stage.step = "fetch-checklist-answers";
-      throw Object.assign(
-        new Error("answers fetch failed"),
-        { details: answersRes.error }
-      );
-    }
-    const rawAnswers = answersRes.data ?? [];
-    const normAnswers = rawAnswers.map((row) => ({
-      ...row,
-      item_id: row.item_id ?? null,
-      yes_no: row.value_yn ?? null,
-      comment: row.value_text ?? null,
-      rating:
-        row.value_number != null ? Number(row.value_number) : null,
-      timer_seconds:
-        row.value_duration_ms != null
-          ? Math.round(row.value_duration_ms / 1000)
-          : null,
-      media_path: row.media_path ?? null,
-      media_type: row.media_type ?? null,
-    }));
-
-    stage.step = "fetch-checklist-defs";
-    const { data: defRows, error: defErr } = await s
-      .from("mission_checklist_items")
-      .select(
-        `
-        id,
-        order_index,
-        title,
-        description,
-        answer_type,
-        yes_no,
-        requires_photo,
-        requires_video,
-        requires_comment,
-        requires_timer,
-        requires_rating,
-        text
-      `
-      )
-      .eq("mission_id", sub.mission_id)
-      .order("order_index", { ascending: true });
-    if (defErr) {
-      stage.step = "fetch-checklist-defs";
-      throw Object.assign(
-        new Error("checklist defs fetch failed"),
-        { details: defErr }
-      );
-    }
-
-    const defs = (defRows ?? []).map((def, idx) => {
-      const raw =
-        (def.text ?? def.title ?? "")?.toString().trim() || "";
       return {
-        id: def.id,
-        displayTitle: raw.length ? raw : "(untitled)",
-        description:
-          typeof def.description === "string" ? def.description : null,
-        answer_type: def.answer_type ?? null,
-        yes_no: def.yes_no ?? null,
-        requires_photo: !!def.requires_photo,
-        requires_video: !!def.requires_video,
-        requires_comment: !!def.requires_comment,
-        requires_timer: !!def.requires_timer,
-        requires_rating: !!def.requires_rating,
-        order_index: def.order_index ?? idx,
+        id: i.checklist_item_id,
+        title: val(meta.title, 'Untitled item'),
+        answer_type: val(meta.answer_type, null),
+        yes_no: val(i.yes_no, null),
+        comment: val(i.comment, null),
+        timer_seconds: val(i.timer_seconds, null),
+        rating: val(i.rating, null),
+        rating_score: val(i.rating_score, null),
+        media,
       };
     });
 
-    const answersByItem = new Map(normAnswers.map((ans) => [ans.item_id, ans]));
+    // Fallback: derive checklist rows from mission_answers for any item_ids
+    // that aren't present in mission_submission_items
+    const already = new Set(checklistFromItems.map((r) => r.id).filter(Boolean));
+    const checklistFromAnswers = [];
 
-    const items = Array.isArray(defs) ? defs : [];
-    stage.step = "collect-photos";
-    const { photosByItem, galleryUrls = [] } = await collectSubmissionPhotos({ supabaseAdmin, submissionId: sub.id });
-    stage.photoUrls = galleryUrls;
-    stage.photosRequested = galleryUrls.length;
+    for (const a of answers) {
+      const cid = a.item_id;
+      if (!cid || already.has(cid)) continue;
 
-    stage.itemPhotoCounts = {};
-    const itemsWithPhotos = items.map((def) => {
-      const ans = answersByItem.get(def.id) || {};
-      const per = photosByItem.get(def.id) || photosByItem.get(def.checklist_item_id) || [];
-      stage.itemPhotoCounts[def.id] = per.length;
-      return {
-        id: def.id,
-        title: def.displayTitle,
-        displayTitle: def.displayTitle,
-        answer_type: def.answer_type,
-        yes_no: ans.yes_no ?? null,
-        rating: ans.rating ?? null,
-        comment: ans.comment ?? null,
-        timer_seconds: ans.timer_seconds ?? null,
-        media_path: ans.media_path ?? null,
-        media_type: ans.media_type ?? null,
-        photoUrls: per.slice(0, 3),
-      };
-    });
+      const meta = checklistMap[cid] || {};
 
-    stage.step = "thread-items";
-    const itemPhotoCounts = stage.itemPhotoCounts;
-    const threadedCount = Object.values(itemPhotoCounts).reduce((sum, count) => sum + (count || 0), 0);
-    stage.photosCount = threadedCount || stage.photoUrls.length;
+      // Map answer values to normalized fields
+      const yes_no = a.value_yn ?? null;
+      const rating =
+        a.value_number != null && !isNaN(Number(a.value_number))
+          ? Number(a.value_number)
+          : null;
+      const comment = a.value_text ?? null;
+      const timer_seconds =
+        a.value_duration_ms != null ? Math.round(Number(a.value_duration_ms) / 1000) : null;
 
-    answersCount = normAnswers.length;
-    itemsCount = defs.length;
-    hasChecklist = itemsCount > 0;
-
-    stage.hasChecklist = hasChecklist;
-    stage.answersCount = answersCount;
-    stage.itemsCount = itemsCount;
-    stage.photosLoaded = 0;
-    stage.checklistPreview = itemsWithPhotos.slice(0, 3).map((item) => ({
-      title: item.displayTitle,
-      rating: item.rating,
-      yes_no: item.yes_no,
-      comment: item.comment,
-      timer_seconds: item.timer_seconds,
-      media_path: item.media_path,
-    }));
-
-    if (process.env.NODE_ENV !== "production") {
-      console.log("[auto:photos]", {
-        submissionId,
-        total: Object.values(itemPhotoCounts).reduce((a, b) => a + b, 0),
-        items: photosByItem.size,
-        gallery: stage.photoUrls.length,
-      });
-      const withPhotos = itemsWithPhotos.filter(
-        (item) => Array.isArray(item.photoUrls) && item.photoUrls.length
-      ).length;
-      console.log("[auto:threading]", {
-        checklistItems: itemsWithPhotos.length,
-        itemsWithPhotos: withPhotos,
-        photosRequested: stage.photosRequested,
-        photosCount: stage.photosCount,
-      });
-    }
-
-    if (process.env.NODE_ENV !== "production") {
-      console.log("[reports/auto] photos", {
-        submissionId,
-        gallery: stage.photoUrls.length,
-        perItem: stage.itemPhotoCounts,
-        photosCount: stage.photosCount,
-      });
-    }
-
-    stage.step = "prepare-pdf";
-    const { rows: pdfItems, attachments } = normalizeAnswersForPdf(answers);
-    const submissionForPdf = {
-      submitted_at: sub.submitted_at || null,
-      comment: [
-        submissionPayload?.comment ?? sub.comment,
-        "Automated summary based on the received checklist.",
-        "Top actions derived from missed checks and low sub-scores.",
-      ]
-        .filter(Boolean)
-        .join("\n\n") || null,
-    };
-
-    baseMeta = {
-      agent_id: agentId ?? null,
-      submission_id: sub.id ?? null,
-      mission_title: mission.title || null,
-      store,
-      address,
-      window_text: win,
-      submitted_at: sub.submitted_at,
-      overall_rating_10: overall10,
-    };
-    stage.meta = baseMeta;
-
-    const urlParams = new URL(req.url);
-    const isDry = urlParams.searchParams.get("dry") === "1";
-
-    const pdfPayload = {
-      title: reportTitle,
-      missionId: mission.id,
-      orgId,
-      submission: submissionForPdf,
-      mission: {
-        id: mission.id,
-        title: mission.title,
-        store,
-        location: { address: mission.address || mission.location?.address || address || "" },
-        status: mission.status,
-        starts_at: mission.starts_at,
-        expires_at: mission.expires_at,
-      },
-      items: pdfItems,
-      attachments,
-      supabaseUrl: process.env.NEXT_PUBLIC_SUPABASE_URL || "",
-      kpis,
-      overall10,
-      checklist: itemsWithPhotos,
-      photoUrls: galleryUrls,
-    };
-
-    if (isDry) {
-      stage.step = "dry-run";
-      return new Response(
-        JSON.stringify({ ok: true, dry: true, stage, payload: pdfPayload }, null, 2),
-        { status: 200, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } }
-      );
-    }
-
-    if (urlParams.searchParams.get("preview") === "1") {
-      stage.step = "preview";
-      return new Response(
-        JSON.stringify({ ok: true, preview: true, stage, submission: sub, items: itemsWithPhotos, photos: galleryUrls }, null, 2),
-        { status: 200, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } }
-      );
-    }
-
-    stage.step = "upsert-report-generating";
-    const type = "mission";
-    const nowIso = new Date().toISOString();
-    const baseKey = {
-      org_id: orgId,
-      mission_id: mission.id,
-      type,
-    };
-    let reportRowId = null;
-    try {
-      const { data: existing, error: existingErr } = await s
-        .from("reports")
-        .select("id")
-        .eq("org_id", orgId)
-        .eq("mission_id", mission.id)
-        .eq("type", type)
-        .maybeSingle();
-
-      if (existingErr) {
-        return json(500, {
-          ok: false,
-          error: existingErr.message || "reports lookup failed",
-          stage,
+      const media = [];
+      if (a.media_path) {
+        media.push({
+          kind: a.media_type || 'unknown',
+          mime: null,
+          path: a.media_path,
+          url: toPublicUrl(a.media_path),
         });
       }
 
-      if (existing?.id) {
-        reportRowId = existing.id;
-        const { error: updateErr } = await s
-          .from("reports")
-          .update({
-            status: "Generating",
-            generated_at: nowIso,
-            title: reportTitle,
-            kpis: kpis || null,
-            meta: baseMeta,
-          })
-          .eq("id", reportRowId);
-
-        if (updateErr) {
-          return json(500, {
-            ok: false,
-            error: updateErr.message || "reports update failed",
-            stage,
-          });
-        }
-      } else {
-        const { data: insertData, error: insertErr } = await s
-          .from("reports")
-          .insert([
-            {
-              ...baseKey,
-              status: "Generating",
-              generated_at: nowIso,
-              title: reportTitle,
-              pdf_url: null,
-              kpis: kpis || null,
-              meta: baseMeta,
-            },
-          ])
-          .select("id")
-          .single();
-
-        if (insertErr) {
-          return json(500, {
-            ok: false,
-            error: insertErr.message || "reports insert failed",
-            stage,
-          });
-        }
-        reportRowId = insertData?.id ?? null;
-      }
-    } catch (err) {
-      return json(500, {
-        ok: false,
-        error: String(err?.message || err),
-        stage,
+      checklistFromAnswers.push({
+        id: cid,
+        title: val(meta.title, 'Untitled item'),
+        answer_type: val(meta.answer_type, null),
+        yes_no,
+        comment,
+        timer_seconds,
+        rating,
+        rating_score: rating,
+        media,
       });
     }
 
-    reportId = reportRowId;
-    stage.report_id = reportId;
+    const checklist = [...checklistFromItems, ...checklistFromAnswers];
 
-    stage.step = "build-pdf";
-    const doc = createPdfDoc();
-    const pdfBuffer = await renderReportDocument(doc, pdfPayload);
+  const photoUrlsRaw = [
+    ...assets
+      .filter((a) => a.kind === 'photo' && a.path)
+      .map((a) => toPublicUrl(a.path))
+      .filter(Boolean),
+    ...answers
+      .filter((a) => a.media_type === 'photo' && a.media_path)
+      .map((a) => toPublicUrl(a.media_path))
+      .filter(Boolean),
+  ];
+  const seen = new Set();
+  const photoUrls = photoUrlsRaw.filter((u) => u && !seen.has(u) && seen.add(u));
 
-    // Upload
-    stage.step = "upload";
-    const objectName = `org_${orgId}/mission_${mission.id}/auto_${Date.now()}.pdf`;
-    const { error: upErr } = await s.storage.from("reports").upload(objectName, pdfBuffer, {
-      contentType: "application/pdf",
-      upsert: true,
-    });
-    if (upErr) {
-      if (reportId) {
-        await s.from("reports").update({ status: "Failed" }).eq("id", reportId);
-      }
-      return json(500, { ok: false, error: "upload failed", details: upErr, stage });
+  return {
+    submission,
+    mission,
+    checklist,
+    photoUrls,
+    counts: {
+      items: checklist.length,
+      photos: photoUrls.length,
+      answers: answers.length,
+      assets: assets.length,
+    },
+  };
+}
+
+export async function POST(req) {
+  const url = new URL(req.url);
+  const diag = url.searchParams.get('diag');
+  const dry = url.searchParams.get('dry') === '1';
+
+  if (diag === 'font') {
+    return NextResponse.json({ ok: true, fontDiag: __fontDiag });
+  }
+
+  let body = {};
+  try {
+    body = await req.json();
+  } catch {
+    body = {};
+  }
+
+  const submissionId =
+    body.submissionId || body.submission_id || body.submission || null;
+  const missionId = body.missionId || body.mission_id || null;
+
+  try {
+    const bundle = await fetchSubmissionBundle({ submissionId, missionId });
+
+    if (diag === 'fetch') {
+      return NextResponse.json({
+        ok: true,
+        diag: 'fetch',
+        inputs: { submissionId, missionId },
+        counts: bundle.counts,
+        sample: {
+          mission: bundle.mission
+            ? { id: bundle.mission.id, title: bundle.mission.title, status: bundle.mission.status }
+            : null,
+          firstChecklist: bundle.checklist[0] || null,
+          firstPhoto: bundle.photoUrls[0] || null,
+        },
+      });
     }
 
-    const { data: pub } = s.storage.from("reports").getPublicUrl(objectName);
-    pdfUrl = pub?.publicUrl || null;
+    if (dry) {
+      return NextResponse.json({
+        ok: true,
+        dry: true,
+        payload: {
+          title: bundle.mission?.title ? `Mission Report — ${bundle.mission.title}` : 'Mission Report',
+          mission: bundle.mission
+            ? {
+                id: bundle.mission.id,
+                title: bundle.mission.title || null,
+                status: bundle.mission.status || null,
+                store: val(bundle.mission.store, null),
+                address: val(bundle.mission?.location?.address, null),
+              }
+            : null,
+          checklist: bundle.checklist,
+          photoUrls: bundle.photoUrls,
+        },
+      });
+    }
 
-    stage.step = "upsert-report-ready";
-    const readyPatch = {
-      status: "Ready",
-      pdf_url: pdfUrl,
-      generated_at: new Date().toISOString(),
-      title: reportTitle,
-      meta: baseMeta,
-      kpis: kpis || null,
+    const supa = getServiceClient();
+
+    const payload = {
+      title: bundle.mission?.title ? `Mission Report — ${bundle.mission.title}` : 'Mission Report',
+      missionId: missionId || bundle.mission?.id || null,
+      orgId: bundle.submission?.org_id || null,
+      submission: {
+        submitted_at: bundle.submission?.submitted_at || null,
+        comment: bundle.submission?.comment || null,
+      },
+      mission: bundle.mission
+        ? {
+            id: bundle.mission.id,
+            title: bundle.mission.title || null,
+            store: val(bundle.mission.store, null),
+            location: { address: val(bundle.mission?.location?.address, null) },
+            status: val(bundle.mission.status, null),
+            starts_at: val(bundle.mission.starts_at, null),
+            expires_at: val(bundle.mission.expires_at, null),
+          }
+        : null,
+      checklist: bundle.checklist.map((row) => ({
+        title: row.title,
+        rating: row.rating ?? row.rating_score ?? null,
+        yes_no: row.yes_no,
+        comment: row.comment,
+      })),
+      photoUrls: bundle.photoUrls,
+      supabaseUrl: process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '',
     };
-      const { data: readyRow, error: updateReadyErr } = await s
-        .from("reports")
-        .update(readyPatch)
-        .eq("org_id", orgId)
-        .eq("mission_id", mission.id)
-        .eq("type", type)
-        .select("id")
-        .single();
-    if (updateReadyErr) {
-      await s
-        .from("reports")
-        .update({
-          status: "Failed",
-          meta: {
-            ...(baseMeta || {}),
-            error:
-              updateReadyErr.message || "Failed to finalize report update",
-          },
-        })
-        .eq("org_id", orgId)
-        .eq("mission_id", mission.id)
-        .eq("type", "mission");
-      return json(500, {
-        ok: false,
-        error: "reports update (ready) failed",
-        details: updateReadyErr,
-        stage,
-      });
-    }
-    reportId = readyRow?.id ?? reportId;
-    stage.report_id = reportId;
 
-    stage.step = "done";
-    const successPayload = {
+    const pdfBytes = await buildMinimalPdf(payload);
+    const pdfBuffer = Buffer.from(pdfBytes);
+    const objectPath = `${payload.orgId || 'unknown'}/${payload.missionId || 'unknown'}/auto_${Date.now()}.pdf`;
+
+    const { error: uploadErr } = await supa.storage
+      .from('mission-uploads')
+      .upload(objectPath, pdfBuffer, { contentType: 'application/pdf', upsert: true });
+    if (uploadErr) {
+      throw new Error(`upload: ${uploadErr.message}`);
+    }
+
+    const pdfUrl = toPublicUrl(objectPath);
+
+    return NextResponse.json({
       ok: true,
       pdf_url: pdfUrl,
-      report_id: reportId,
-      answersCount,
-      itemsCount,
-      photosCount: stage.photosCount,
-      photosRequested: stage.photosRequested,
-      hasChecklist,
-      resolveSource,
-      stage,
-    };
-    return new Response(JSON.stringify(successPayload, null, 2), {
-      status: 200,
-      headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+      counts: bundle.counts,
     });
   } catch (e) {
-    try {
-      const message = String(e?.message || e);
-      if (stage?.report_id) {
-        await supabaseAdmin
-          .from("reports")
-          .update({
-            status: "Failed",
-            meta: { ...(baseMeta || {}), error: message },
-          })
-          .eq("id", stage.report_id);
-      }
-    } catch {
-      // ignore secondary failure
-    }
-    stage.step = "error";
-    stage.error = String(e?.message || e);
-    return new Response(JSON.stringify({ ok: false, error: stage.error, stage }, null, 2), {
-      status: 500,
-      headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
-    });
+    return NextResponse.json(
+      {
+        ok: false,
+        diag: diag || undefined,
+        error: String(e?.message || e),
+      },
+      { status: 500 }
+    );
   }
 }

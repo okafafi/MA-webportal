@@ -4,7 +4,7 @@ export const dynamic = "force-dynamic";
 
 import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
-import { buildPdf } from "../../../../lib/report_pdf";
+import { buildMinimalPdf } from "../../../../lib/report_pdf";
 
 const supabaseAdmin = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
@@ -52,7 +52,7 @@ export async function GET() {
 
     const attachments = [];
 
-    const pdfBuffer = await buildPdf({
+    const pdfBytes = await buildMinimalPdf({
       missionId,
       orgId,
       submission,
@@ -62,7 +62,7 @@ export async function GET() {
       supabaseUrl: process.env.NEXT_PUBLIC_SUPABASE_URL || "",
     });
 
-    return new Response(pdfBuffer, {
+    return new Response(pdfBytes, {
       status: 200,
       headers: {
         "Content-Type": "application/pdf",

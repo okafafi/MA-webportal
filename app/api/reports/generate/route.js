@@ -3,7 +3,7 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 import { supabaseAdmin } from '../../../../lib/supabaseAdmin';
-import { buildPdf } from '../../../../lib/report_pdf';
+import { buildMinimalPdf } from '../../../../lib/report_pdf';
 
 const json = (s, o) =>
   new Response(JSON.stringify(o, null, 2), {
@@ -126,7 +126,7 @@ export async function POST(req) {
 
     // 7) Build PDF buffer (branded; thumbnails via public URLs)
     stage.step = "build-pdf";
-    const pdfBuffer = await buildPdf({
+    const pdfBytes = await buildMinimalPdf({
       missionId,
       orgId,
       submission: sub,
@@ -136,6 +136,7 @@ export async function POST(req) {
       // <-- critical so the builder can form public storage URLs
       supabaseUrl: process.env.NEXT_PUBLIC_SUPABASE_URL || "",
     });
+    const pdfBuffer = Buffer.from(pdfBytes);
 
     // 8) Upload to 'reports' bucket (public)
     stage.step = "upload";
