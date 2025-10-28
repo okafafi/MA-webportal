@@ -1337,9 +1337,27 @@ function ReportsList({ orgId }) {
                    style={buttonPrimary}
                    onClick={async () => {
                      try {
-                       const agentId = r?.meta?.agent_id || r?.meta?.agentId || r?.meta?.agentID || null;
-                       if (!orgId || !r?.mission_id || !agentId) {
-                         alert("Missing orgId, missionId, or agentId to generate report.");
+                       const missionId = r?.mission_id || r?.meta?.mission_id || r?.meta?.missionId || null;
+                       const submissionId =
+                         r?.submission_id ||
+                         r?.meta?.submission_id ||
+                         r?.meta?.submissionId ||
+                         r?.meta?.submission?.id ||
+                         null;
+                       const agentId =
+                         r?.meta?.agent_id ||
+                         r?.meta?.agentId ||
+                         r?.meta?.agentID ||
+                         r?.agent_id ||
+                         null;
+
+                       if (!orgId || !missionId) {
+                         alert("Missing orgId or missionId to generate report.");
+                         return;
+                       }
+
+                       if (!submissionId) {
+                         alert("Missing submissionId for this report.");
                          return;
                        }
 
@@ -1347,11 +1365,11 @@ function ReportsList({ orgId }) {
                          method: "POST",
                          headers: { "Content-Type": "application/json" },
                          cache: "no-store",
-                         body: JSON.stringify({
-                           orgId,
-                           missionId: r.mission_id,
-                           agentId,
-                         }),
+                         body: JSON.stringify(
+                           agentId
+                             ? { orgId, missionId, submissionId, agentId }
+                             : { orgId, missionId, submissionId }
+                         ),
                        });
                        const js = await resp.json().catch(() => ({}));
                        if (!resp.ok || js?.error) {
